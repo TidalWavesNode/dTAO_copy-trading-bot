@@ -1,8 +1,12 @@
+---
+
+### `ecosystem.config.js`
+```js
 module.exports = {
   apps: [
     {
-      name: "bt-copytrader",
-      script: "copytrader_all.py",
+      name: "bt-taoplicate",
+      script: "taoplicate.py",
       args: "run --summary-now",
       interpreter: "python3",
       watch: false,
