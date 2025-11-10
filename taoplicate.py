@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BitTensor Global Copy-Trading Bot
----------------------------------
+TAOplicate — Real-Time BitTensor Copy-Trading Bot
+-------------------------------------------------
 - Watches chosen hotkeys across ALL subnets for stake/unstake changes.
 - Realtime via local Subtensor node WS; fallback to Finney WS; fallback polling.
 - Mirrors actions with btcli using fixed / proportional / weighted proportional sizing.
@@ -17,11 +17,12 @@ import requests
 import bittensor as bt
 from substrateinterface import SubstrateInterface
 
-CONFIG_DIR  = os.path.expanduser("~/.candles")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "copytrader_config.json")
-STATE_PATH  = os.path.join(CONFIG_DIR, "copytrader_state.json")
-LOG_PATH    = os.path.join(CONFIG_DIR, "copytrader.log")
-DB_PATH     = Path(CONFIG_DIR) / "copytrader.db"
+# === Rebranded paths/files ===
+CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "taoplicate_config.json")
+STATE_PATH  = os.path.join(CONFIG_DIR, "taoplicate_state.json")
+LOG_PATH    = os.path.join(CONFIG_DIR, "taoplicate.log")
+DB_PATH     = Path(CONFIG_DIR) / "taoplicate.db"
 
 event_queue = queue.Queue()
 
@@ -82,7 +83,7 @@ def log_trade_to_db(action, netuid, hk, amount, delta, balance):
 
 # ----------------- Discord -----------------
 def post_embed(webhook, embed):
-    if not webhook: 
+    if not webhook:
         return
     try:
         requests.post(webhook, json={"embeds": [embed]}, timeout=8)
@@ -104,7 +105,7 @@ def send_trade_embed(cfg, action, netuid, hk, amount, delta):
         "title": title,
         "description": desc,
         "color": color,
-        "footer": {"text": f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} | BitTensor CopyTrader"},
+        "footer": {"text": f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"},
     }
     post_embed(webhook, embed)
 
@@ -139,7 +140,7 @@ def get_wallet_balance_via_btcli(cfg):
         rc, out, err = run_btcli(cmd)
         if not out:
             return 0.0
-        # look for first float; prefer 'Total' line if present
+        # Prefer a 'Total Balance' line, else first float fallback
         for line in out.splitlines():
             if "Total" in line and "Balance" in line:
                 for tok in line.replace(",", " ").split():
@@ -182,7 +183,7 @@ def send_summary_embed(cfg, summary):
     total_rem = summary.get("rem_tao", 0.0)
     net = total_add - total_rem
 
-    # trend arrows
+    # trend arrows (balance change since last report)
     trend_file = os.path.join(CONFIG_DIR, "last_balance.json")
     last_balance = 0.0
     if os.path.exists(trend_file):
@@ -203,7 +204,7 @@ def send_summary_embed(cfg, summary):
     net_line = f"🟩 **Net Gain:** `{net:+.4f} TAO`" if net >= 0 else f"🟥 **Net Loss:** `{net:+.4f} TAO`"
 
     embed = {
-        "title": "📊 Daily CopyTrader Summary",
+        "title": "📊 Daily Summary — TAOplicate",
         "color": 0x2B6CB0,
         "description": (
             f"**Total Trades:** {summary.get('trades', 0)}\n"
@@ -213,7 +214,7 @@ def send_summary_embed(cfg, summary):
             f"{net_line}\n\n"
             f"💰 **Wallet Balance:** `{total_balance:.4f} TAO` ({trend_emoji} {trend_line} since last report)"
         ),
-        "footer": {"text": f"Report generated {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | BitTensor CopyTrader"},
+        "footer": {"text": f"Report generated {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"},
     }
     post_embed(webhook, embed)
 
@@ -303,9 +304,9 @@ def setup():
     init_db()
     log("Setup complete.")
     if live_webhook:
-        notify_text(live_webhook, f"✅ CopyTrader setup complete for {len(hotkeys)} wallets on `{network}`.")
+        notify_text(live_webhook, f"✅ TAOplicate setup complete for {len(hotkeys)} wallets on `{network}`.")
     if summary_webhook:
-        notify_text(summary_webhook, "📊 CopyTrader daily summary channel initialized.")
+        notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
 
 def run():
     dry_run = "--dry-run" in sys.argv
@@ -313,7 +314,7 @@ def run():
 
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
-        log("Run setup first."); 
+        log("Run setup first.")
         return
 
     state = load_json(STATE_PATH, {"last_stakes": {}})
@@ -368,10 +369,10 @@ def run():
             n_subnets = subtensor.subnet_count
             for netuid in range(n_subnets):
                 mg = subtensor.metagraph(netuid=netuid)
-                if not mg.hotkeys: 
+                if not mg.hotkeys:
                     continue
                 for i, hk in enumerate(cfg["hotkeys"]):
-                    if hk not in mg.hotkeys: 
+                    if hk not in mg.hotkeys:
                         continue
                     idx = mg.hotkeys.index(hk)
                     stake_val = float(mg.stake[idx])
@@ -412,13 +413,13 @@ def run():
 
         except Exception as e:
             log(f"Loop error: {e}")
-            notify_text(cfg.get("live_webhook"), f"⚠️ CopyTrader error: `{e}`")
+            notify_text(cfg.get("live_webhook"), f"⚠️ TAOplicate error: `{e}`")
 
         time.sleep(poll)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ["setup", "run"]:
-        print("Usage: python3 copytrader_all.py setup|run [--summary-now] [--dry-run]")
+        print("Usage: python3 taoplicate.py setup|run [--summary-now] [--dry-run]")
         sys.exit(1)
     if sys.argv[1] == "setup":
         setup()
