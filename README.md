@@ -1,4 +1,8 @@
-# 🧠 TAOplicate — Real-Time BitTensor Copy-Trading Bot
+<p align="center">
+  <img width="482" height="482" alt="taoplicate-top-left" src="https://github.com/user-attachments/assets/b5a6e44a-8079-4246-a383-29849c3f5044" />
+</p>
+
+# TAOplicate: A Real-Time BitTensor Copy-Trading Bot 
 
 Real-time, PM2-managed bot that mirrors **stake/unstake** actions from chosen BitTensor **hotkeys** across **all subnets** using your wallet — with Discord alerts, daily summaries (00:00 UTC), automatic low-balance pause/resume, **SQLite analytics**, **weighted proportional mode**, and **dry-run** simulation.
 
@@ -114,14 +118,13 @@ pm2 save
 “Stake Added” (green) or “Stake Removed” (red) with subnet, hotkey, Δ, mirrored amount.
 Daily summary (00:00 UTC, neutral color)
 Total trades, subnets touched, total staked/unstaked
+🟩/🟥 Net gain/loss
+💰 Wallet balance with 📈/📉 since last report
 ```
 
-🟩/🟥 Net gain/loss
-
-💰 Wallet balance with 📈/📉 since last report
-
-##🛡️ Safety & Ops
-```Auto-pause when balance < low_balance → Discord alert
+## 🛡️ Safety & Ops
+```
+Auto-pause when balance < low_balance → Discord alert
 Auto-resume when balance >= resume_balance → Discord notice
 Event-driven via WS, with Finney fallback and polling safety net
 Dry-run for rehearsals
