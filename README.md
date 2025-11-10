@@ -9,7 +9,7 @@ TAOplicate — Real-Time BitTensor Copy-Trading Bot
 - Uses TAOStats on the backend (no prompts) to focus polling on relevant subnets.
 - Wallet balance via `btcli w balance --wallet-name <wallet> --network <net>`.
 - SQLite audit log.
-- PM2 integration: always prompt at end of setup (unless --pm2/--no-pm2).
+- PM2 integration: always prompt at end of setup (unless --pm2/--no-pm2). Prompt works even if stdin is weird.
 """
 
 import os, sys, time, json, shutil, sqlite3, subprocess, datetime, threading, queue, re, logging
@@ -34,16 +34,39 @@ except Exception:
     pass
 GREEN = "\033[92m"
 RESET = "\033[0m"
-def ginput(prompt_text: str) -> str:
+
+def _tty_input(prompt: str) -> str:
+    """Try to read from /dev/tty even if stdin is not a TTY."""
     try:
-        return input(f"{GREEN}{prompt_text}{RESET}")
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        with open("/dev/tty", "r") as tty:
+            return tty.readline().rstrip("\n")
     except Exception:
-        return input(prompt_text)
+        return ""
+
+def ginput(prompt_text: str) -> str:
+    """Green prompt input with robust fallbacks (stdin, then /dev/tty)."""
+    prompt = f"{GREEN}{prompt_text}{RESET}"
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return input()  # uses the already-printed prompt
+    except EOFError:
+        # fallback to /dev/tty
+        return _tty_input(prompt)
+    except Exception:
+        # last resort plain input
+        try:
+            return input(prompt_text)
+        except Exception:
+            return _tty_input(prompt)
+
 def gprint(text: str):
     try:
-        print(f"{GREEN}{text}{RESET}")
+        print(f"{GREEN}{text}{RESET}", flush=True)
     except Exception:
-        print(text)
+        print(text, flush=True)
 
 # Paths
 CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
@@ -467,6 +490,7 @@ def setup():
     save_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
     init_db()
     log("Setup complete.")
+    sys.stdout.flush()
 
     # PM2: always prompt unless explicit flags
     if "--pm2" in sys.argv:
@@ -474,8 +498,9 @@ def setup():
     elif "--no-pm2" in sys.argv:
         gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
     else:
-        yn = (ginput("Start TAOplicate now with pm2? [y/N]: ").strip().lower() or "n")
-        if yn == "y":
+        # FORCE a prompt even in odd environments by using our robust ginput()
+        ans = (ginput("Start TAOplicate now with pm2? [y/N]: ").strip().lower() or "n")
+        if ans == "y":
             start_pm2_or_hint()
         else:
             gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
@@ -513,7 +538,7 @@ def run():
     poll = int(cfg["poll_seconds"])
     while True:
         try:
-            # Realtime events (if any)
+            # Realtime events
             while not event_queue.empty():
                 action, netuid, hk, delta = event_queue.get()
                 if hk not in cfg["hotkeys"]: continue
