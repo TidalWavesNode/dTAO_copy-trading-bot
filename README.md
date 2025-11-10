@@ -1,4 +1,4 @@
-# 🕯️ BitTensor CopyTrader — Global Copy-Staking Bot
+# 🧠 TAOplicate — Real-Time BitTensor Copy-Trading Bot
 
 Real-time, PM2-managed bot that mirrors **stake/unstake** actions from chosen BitTensor **hotkeys** across **all subnets** using your wallet — with Discord alerts, daily summaries (00:00 UTC), automatic low-balance pause/resume, **SQLite analytics**, **weighted proportional mode**, and **dry-run** simulation.
 
@@ -9,23 +9,24 @@ Real-time, PM2-managed bot that mirrors **stake/unstake** actions from chosen Bi
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![bittensor](https://img.shields.io/badge/bittensor-finney-orange)
 
+---
+
 ## ✨ Features
-- **Global copy-staking**: watches your list of **hotkeys** on **every subnet**; mirrors stake adds/removes.
-- **Real-time events** via **local Subtensor node** (primary) with **Finney WS** fallback + **polling** as safety.
-- **Trade sizing modes**: `fixed`, `proportional`, or **weighted proportional** (per-hotkey weight).
+- **Global copy-staking** — watches your **hotkeys** on **every subnet**; mirrors stake adds/removes.
+- **Realtime** via **local Subtensor node WS** (primary), **Finney WS** fallback, plus **polling** backup.
+- **Trade sizing modes** — `fixed`, `proportional`, or **weighted proportional** (per-hotkey weight).
 - **Discord**:
-  - **Live alerts** (colored embeds for each mirrored stake/unstake).
-  - **Daily summary** at **00:00 UTC** to a separate webhook: totals, net gain/loss, wallet balance with **📈/📉 trend**.
-- **Safety**: Auto-pause when TAO balance falls below threshold; **auto-resume** when balance recovers.
-- **Analytics**: All mirrored actions stored in **SQLite** (`~/.candles/copytrader.db`).
-- **Dry-run** mode for safe testing (no on-chain transactions).
-- **PM2** integration for process supervision.
+  - **Live alerts** (color embeds on each mirrored trade).
+  - **Daily summary** at **00:00 UTC** (totals, net gain/loss, wallet balance with **📈/📉 trend**).
+- **Safety** — auto-pause when wallet TAO `< low_balance`, auto-resume when `>= resume_balance`.
+- **Analytics** — every action written to **SQLite** (`~/.taoplicate/taoplicate.db`).
+- **Ops-friendly** — flags for `--dry-run` and `--summary-now`, plus PM2 integration.
 
 ---
 
 ## 🧱 Architecture
 
-```
+```mermaid
 flowchart LR
   A[Local Subtensor Node (ws://127.0.0.1:9944)] -->|StakeAdded / StakeRemoved| E{Event Listener}
   B[Finney WS Backup (wss://finney.subtensor.ai:443)] -->|If local fails| E
@@ -43,8 +44,8 @@ flowchart LR
 Prereqs: Python 3.10+, Node.js (for PM2), btcli configured, and (recommended) a local subtensor node exposing WebSocket ws://127.0.0.1:9944
 
 ### Clone and enter
-`git clone https://github.com/TidalWavesNode/dTAO_copy-trading-bot.git`
-`cd dTAO_copy-trading-bot`
+`git clone https://github.com/TidalWavesNode/TAOplicate.git`
+`cd taoplicate`
 
 ### Python deps
 `python3 -m venv .venv && source .venv/bin/activate`
@@ -54,32 +55,32 @@ Prereqs: Python 3.10+, Node.js (for PM2), btcli configured, and (recommended) a 
 `npm i -g pm2`
 
 ## 🚀 First-Run Setup
-`python3 copytrader_all.py setup`
+`python3 taoplicate.py setup`
 
-You’ll be prompted for:
+Prompts include:
 Network (e.g., finney)
-Your wallet name (for btcli --wallet-name)
-Fixed TAO per trade (used only if fixed mode)
+Your wallet name (--wallet-name)
+Fixed TAO per trade (only used if fixed mode)
 Watched hotkeys (each line supports optional weight, e.g. 5Eabc.. 0.6)
-Polling seconds (fallback heartbeat; 20–60s recommended)
+Polling seconds (fallback heartbeat; 20–60s typical)
 Trade type: fixed or proportional
 Discord webhooks: one for live alerts, one for daily summary
-Low/resume balance thresholds (for auto-pause/resume)
+Low/resume balance thresholds (auto-pause/resume)
 
 Files created:
-~/.candles/copytrader_config.json
-~/.candles/copytrader_state.json
-~/.candles/copytrader.db
-~/.candles/copytrader.log
-~/.candles/last_balance.json
+~/.taoplicate/taoplicate_config.json
+~/.taoplicate/taoplicate_state.json
+~/.taoplicate/taoplicate.db
+~/.taoplicate/taoplicate.log
+~/.taoplicate/last_balance.json
 
 ## Run
-`python3 copytrader_all.py run --summary-now`
+`python3 taoplicate.py run --summary-now`
 # add --dry-run to simulate without btcli transactions
 
 ### PM2:
-`pm2 start ecosystem.config.js --name bt-copytrader -- "run --summary-now"
-pm2 logs bt-copytrader --lines 200
+`pm2 start ecosystem.config.js --name bt-taoplicate -- "run --summary-now"
+pm2 logs bt-taoplicate --lines 200
 pm2 save`
 
 ## 🖼️ Discord Examples
@@ -96,7 +97,7 @@ Auto-resume when balance >= resume_balance → Discord notice
 Event-driven via WS, with Finney fallback and polling safety net
 Dry-run for rehearsals
 SQLite for audit/analytics:
-`sqlite3 ~/.candles/copytrader.db \
+`sqlite3 ~/.taoplicate/taoplicate.db \
   "SELECT timestamp,action,netuid,hotkey,amount,delta FROM trades ORDER BY id DESC LIMIT 20;"`
 
 ## 🧪 Tips
