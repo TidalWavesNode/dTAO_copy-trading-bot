@@ -3,8 +3,8 @@
 TAOplicate — Real-Time BitTensor Copy-Trading Bot
 -------------------------------------------------
 - Watches chosen hotkeys across ALL subnets for stake/unstake changes.
-- Realtime via local Subtensor node WS; fallback to Finney WS; fallback polling.
-- Mirrors actions with btcli using fixed / proportional / weighted proportional sizing.
+- Realtime via local Subtensor node WS; fallback to Finney WS; polling heartbeat backup.
+- Mirrors actions with btcli using fixed / proportional (% of delta) + per-wallet weighting.
 - Discord live alerts + daily summary (00:00 UTC) with net gain/loss and wallet trend.
 - Auto-pause on low balance, auto-resume on recovery.
 - SQLite logging, --dry-run support, --summary-now at startup.
@@ -17,7 +17,7 @@ import requests
 import bittensor as bt
 from substrateinterface import SubstrateInterface
 
-# === Rebranded paths/files ===
+# === Paths / files ===
 CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "taoplicate_config.json")
 STATE_PATH  = os.path.join(CONFIG_DIR, "taoplicate_state.json")
@@ -26,7 +26,7 @@ DB_PATH     = Path(CONFIG_DIR) / "taoplicate.db"
 
 event_queue = queue.Queue()
 
-# ----------------- Utility -----------------
+# ----------------- Logging / JSON utils -----------------
 def log(msg: str):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -133,23 +133,37 @@ def run_btcli(cmd):
         return 127, "", "not found"
 
 def get_wallet_balance_via_btcli(cfg):
-    """Parse wallet total balance using `btcli w balance --all` output."""
+    """Parse wallet total balance using `btcli w balance --wallet-name` (no --all)."""
     try:
-        cmd = [cfg["btcli_path"], "w", "balance", "--all", "--wallet-name", cfg["my_wallet"], "--network", cfg["network"]]
+        cmd = [
+            cfg["btcli_path"], "w", "balance",
+            "--wallet-name", cfg["my_wallet"],
+            "--network", cfg["network"]
+        ]
         log("Fetching wallet balance via btcli...")
         rc, out, err = run_btcli(cmd)
         if not out:
             return 0.0
-        # Prefer a 'Total Balance' line, else first float fallback
+
+        # Prefer lines mentioning Balance/Free/Total/Available, grab first float
+        best = None
         for line in out.splitlines():
-            if "Total" in line and "Balance" in line:
+            low = line.lower()
+            if any(k in low for k in ["balance", "free", "total", "available"]):
                 for tok in line.replace(",", " ").split():
                     try:
-                        return float(tok)
+                        best = float(tok)
+                        break
                     except:
                         pass
-        m = re.search(r"([0-9]+\.[0-9]+)", out)
-        return float(m.group(1)) if m else 0.0
+            if best is not None:
+                break
+
+        if best is None:
+            m = re.search(r"([0-9]+\.[0-9]+)", out)
+            return float(m.group(1)) if m else 0.0
+
+        return best
     except Exception as e:
         log(f"Error fetching wallet balance: {e}")
         return 0.0
@@ -173,7 +187,7 @@ def mirror_stake(action, netuid, cfg, amount, hk, delta, summary):
     if action == "add": summary["add_tao"] += amount
     else: summary["rem_tao"] += amount
 
-# ----------------- Summary -----------------
+# ----------------- Daily Summary -----------------
 def send_summary_embed(cfg, summary):
     webhook = cfg.get("summary_webhook")
     if not webhook: return
@@ -226,7 +240,7 @@ def summary_scheduler(cfg, summary):
         send_summary_embed(cfg, summary.copy())
         summary.update({"trades": 0, "add_tao": 0.0, "rem_tao": 0.0, "subnets": set()})
 
-# ----------------- Event Listener -----------------
+# ----------------- Event Listener (local -> Finney fallback) -----------------
 def start_event_listener(cfg):
     """Connect to local node for realtime; fallback to Finney; push events into queue."""
     urls = ["ws://127.0.0.1:9944", "wss://finney.subtensor.ai:443"]
@@ -264,13 +278,101 @@ def start_event_listener(cfg):
     except Exception as e:
         log(f"Subscription error: {e}")
 
+# ----------------- Subnet discovery (no 'subnet_count' dependency) -----------------
+_NETUID_CACHE = {"list": [], "ts": 0}
+
+def discover_netuids(subtensor, max_scan=256, cache_secs=600):
+    """
+    Returns a list of active netuids.
+    Tries modern APIs first, then legacy, then a safe scan fallback.
+    Caches results for a short period to avoid heavy calls.
+    """
+    now = time.time()
+    if _NETUID_CACHE["list"] and now - _NETUID_CACHE["ts"] < cache_secs:
+        return _NETUID_CACHE["list"]
+
+    # 1) Preferred (modern)
+    try:
+        if hasattr(subtensor, "get_all_subnet_netuids"):
+            netuids = list(subtensor.get_all_subnet_netuids())
+            if netuids:
+                _NETUID_CACHE.update({"list": netuids, "ts": now})
+                return netuids
+    except Exception:
+        pass
+
+    # 2) Legacy
+    try:
+        if hasattr(subtensor, "subnets"):
+            subs = subtensor.subnets()
+            netuids = [getattr(s, "netuid", None) for s in subs]
+            netuids = [n for n in netuids if isinstance(n, int)]
+            if netuids:
+                _NETUID_CACHE.update({"list": netuids, "ts": now})
+                return netuids
+    except Exception:
+        pass
+
+    # 3) Fallback: lightweight scan
+    netuids = []
+    for uid in range(max_scan):
+        try:
+            mg = subtensor.metagraph(netuid=uid)
+            if getattr(mg, "hotkeys", None) is not None:
+                netuids.append(uid)
+        except Exception:
+            continue
+
+    netuids = sorted(set(netuids))
+    _NETUID_CACHE.update({"list": netuids, "ts": now})
+    return netuids
+
 # ----------------- Setup / Run -----------------
 def setup():
     os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Brief intro (replaces ASCII art)
+    print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
+
+    # Network first (default finney)
     network = input("Network (default finney): ").strip() or "finney"
+
     my_wallet = input("Your wallet name: ").strip()
-    amt = input("Fixed TAO per trade (e.g. 0.1): ").strip()
-    n = int(input("How many hotkeys to copy: ").strip())
+
+    # ===== Mode FIRST =====
+    print("\nTrade sizing mode:")
+    print("  - fixed: use a constant TAO amount each time")
+    print("  - proportional: mirror a percentage of the watched wallet’s stake change")
+    mode = (input("Choose 'fixed' or 'proportional' [fixed/proportional]: ").strip().lower() or "fixed")
+    while mode not in ("fixed", "proportional"):
+        mode = (input("Please choose 'fixed' or 'proportional': ").strip().lower() or "fixed")
+
+    fixed_amount = ""
+    proportional_pct = ""
+    if mode == "fixed":
+        fixed_amount = input("Fixed TAO per trade (e.g., 0.25): ").strip()
+        while True:
+            try:
+                _ = float(fixed_amount)
+                break
+            except:
+                fixed_amount = input("Please enter a numeric TAO amount (e.g., 0.25): ").strip()
+    else:
+        print("\nProportional mode means: if a watched wallet stakes +1.00 TAO, and you choose 50%,")
+        print("you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes.")
+        proportional_pct = input("Proportional percentage to mirror (1–100, default 100): ").strip() or "100"
+        while True:
+            try:
+                v = float(proportional_pct)
+                if 0 < v <= 100:
+                    break
+                else:
+                    proportional_pct = input("Enter a number between 1 and 100: ").strip()
+            except:
+                proportional_pct = input("Enter a number between 1 and 100: ").strip()
+
+    # Watched hotkeys + optional weights
+    n = int(input("\nHow many hotkeys to copy: ").strip())
     hotkeys, weights = [], []
     print("Enter each hotkey + optional weight (default 1.0). Example: 5Eabc123 0.6")
     for i in range(n):
@@ -278,21 +380,26 @@ def setup():
         hotkeys.append(parts[0])
         weights.append(float(parts[1]) if len(parts) > 1 else 1.0)
 
-    poll = int(input("Polling seconds (default 30): ") or "30")
-    mode = (input("Trade type — 'fixed' or 'proportional'? ").strip().lower() or "fixed")
+    # Heartbeat poll (backup only)
+    poll = int(input("Polling seconds for backup (default 30): ") or "30")
+
+    # Webhooks
     live_webhook = input("Discord Webhook for LIVE trade alerts: ").strip()
     summary_webhook = input("Discord Webhook for DAILY summary reports: ").strip()
-    low_bal = float(input("Low-balance threshold (pause when below, e.g. 1.0 TAO): ").strip() or 1.0)
-    resume_bal = float(input("Resume-balance threshold (resume when above, e.g. 2.0 TAO): ").strip() or 2.0)
+
+    # Safety thresholds
+    low_bal = float(input("Low-balance threshold (pause if below, e.g., 1.0 TAO): ").strip() or 1.0)
+    resume_bal = float(input("Resume-balance threshold (resume when above, e.g., 2.0 TAO): ").strip() or 2.0)
 
     cfg = {
-        "network": network,
+        "network": network,                 # e.g., finney
         "my_wallet": my_wallet,
-        "fixed_amount": amt,
+        "trade_mode": mode,                 # fixed | proportional
+        "fixed_amount": fixed_amount,
+        "proportional_pct": proportional_pct,
         "hotkeys": hotkeys,
         "weights": weights,
         "poll_seconds": poll,
-        "trade_mode": mode,
         "live_webhook": live_webhook,
         "summary_webhook": summary_webhook,
         "low_balance": low_bal,
@@ -309,6 +416,9 @@ def setup():
         notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
 
 def run():
+    # Brief intro (replaces ASCII art)
+    print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
+
     dry_run = "--dry-run" in sys.argv
     summary_now = "--summary-now" in sys.argv
 
@@ -338,16 +448,23 @@ def run():
 
     while True:
         try:
-            # process realtime events
+            # ===== process realtime events =====
             while not event_queue.empty():
                 action, netuid, hk, delta = event_queue.get()
                 if hk not in cfg["hotkeys"]:
                     continue
                 i = cfg["hotkeys"].index(hk)
                 weight = cfg["weights"][i]
-                amount = float(cfg["fixed_amount"]) if cfg["trade_mode"] == "fixed" else abs(delta) * weight
 
-                # safety
+                # amount calculation (fixed OR proportional% of delta), then apply weight
+                if cfg["trade_mode"] == "fixed":
+                    amount = float(cfg["fixed_amount"])
+                else:
+                    pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
+                    amount = abs(delta) * pct
+                amount *= weight
+
+                # safety: pause/resume by wallet balance
                 current_balance = get_wallet_balance_via_btcli(cfg)
                 if not paused and current_balance < cfg["low_balance"]:
                     paused = True
@@ -365,28 +482,36 @@ def run():
                     mirror_stake(action, netuid, cfg, amount, hk, delta, summary)
                     log_trade_to_db(action, netuid, hk, amount, delta, current_balance)
 
-            # fallback polling (heartbeat)
-            n_subnets = subtensor.subnet_count
-            for netuid in range(n_subnets):
+            # ===== fallback polling (heartbeat) =====
+            netuids = discover_netuids(subtensor, max_scan=256, cache_secs=600)
+            for netuid in netuids:
                 mg = subtensor.metagraph(netuid=netuid)
-                if not mg.hotkeys:
+                if not getattr(mg, "hotkeys", None):
                     continue
                 for i, hk in enumerate(cfg["hotkeys"]):
                     if hk not in mg.hotkeys:
                         continue
                     idx = mg.hotkeys.index(hk)
                     stake_val = float(mg.stake[idx])
+
+                    # remember last stake for this (netuid, hotkey)
                     state["last_stakes"].setdefault(str(netuid), {})
                     last = state["last_stakes"][str(netuid)].get(hk)
                     state["last_stakes"][str(netuid)][hk] = stake_val
                     if last is None:
                         continue
+
                     delta = stake_val - last
                     if abs(delta) < 1e-9:
                         continue
 
                     weight = cfg["weights"][i]
-                    amount = float(cfg["fixed_amount"]) if cfg["trade_mode"] == "fixed" else abs(delta) * weight
+                    if cfg["trade_mode"] == "fixed":
+                        amount = float(cfg["fixed_amount"])
+                    else:
+                        pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
+                        amount = abs(delta) * pct
+                    amount *= weight
 
                     current_balance = get_wallet_balance_via_btcli(cfg)
                     if not paused and current_balance < cfg["low_balance"]:
@@ -417,6 +542,7 @@ def run():
 
         time.sleep(poll)
 
+# ----------------- Entrypoint -----------------
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ["setup", "run"]:
         print("Usage: python3 taoplicate.py setup|run [--summary-now] [--dry-run]")
