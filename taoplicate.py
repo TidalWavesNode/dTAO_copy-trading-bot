@@ -35,12 +35,19 @@ except Exception:
 # === ANSI helpers ===
 GREEN = "\033[92m"
 RESET = "\033[0m"
+BOLD = "\033[1m"
 def ginput(prompt_text: str) -> str:
     """Green prompt input with graceful fallback."""
     try:
         return input(f"{GREEN}{prompt_text}{RESET}")
     except Exception:
         return input(prompt_text)
+
+def gprint(text: str):
+    try:
+        print(f"{GREEN}{text}{RESET}")
+    except Exception:
+        print(text)
 
 # === Paths / files ===
 CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
@@ -415,9 +422,9 @@ def setup():
 
     # Trade sizing mode FIRST (numeric)
     print()
-    print(GREEN + "Trade sizing mode:" + RESET)
-    print(GREEN + "  1) fixed — use a constant TAO amount each time" + RESET)
-    print(GREEN + "  2) proportional — mirror a percentage of the watched wallet’s stake change" + RESET)
+    gprint("Trade sizing mode:")
+    gprint("  1) fixed — use a constant TAO amount each time")
+    gprint("  2) proportional — mirror a percentage of the watched wallet’s stake change")
     mode_sel = (ginput("Choose 1 or 2 [1/2]: ").strip() or "1")
     while mode_sel not in ("1", "2"):
         mode_sel = (ginput("Please choose 1 (fixed) or 2 (proportional): ").strip() or "1")
@@ -437,18 +444,18 @@ def setup():
 
         # Explain and offer weights-in-fixed
         print()
-        print(GREEN + "Option: Per-hotkey weights in FIXED mode" + RESET)
-        print(GREEN + "  If enabled, your fixed amount is multiplied per wallet by its weight." + RESET)
-        print(GREEN + "  Examples:" + RESET)
-        print(GREEN + "    • Fixed = 0.25 TAO, weight 2.0  → you trade 0.50 TAO for that wallet" + RESET)
-        print(GREEN + "    • Fixed = 0.25 TAO, weight 0.5  → you trade 0.125 TAO for that wallet" + RESET)
-        print(GREEN + "  Impact: lets you prioritize or downweight specific wallets without changing the global fixed size." + RESET)
+        gprint("Option: Per-hotkey weights in FIXED mode")
+        gprint("  If enabled, your fixed amount is multiplied per wallet by its weight.")
+        gprint("  Examples:")
+        gprint("    • Fixed = 0.25 TAO, weight 2.0  → you trade 0.50 TAO for that wallet")
+        gprint("    • Fixed = 0.25 TAO, weight 0.5  → you trade 0.125 TAO for that wallet")
+        gprint("  Impact: lets you prioritize or downweight specific wallets without changing the global fixed size.")
         yn = (ginput("Enable per-hotkey weights in FIXED mode? [y/N]: ").strip().lower() or "n")
         weights_in_fixed = yn == "y"
 
     else:
         print()
-        print(GREEN + "Proportional mode = If a watched wallet stakes +1.00 TAO and you set 50%, you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes." + RESET)
+        gprint("Proportional mode = If a watched wallet stakes +1.00 TAO and you set 50%, you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes.")
         proportional_pct = ginput("Proportional percentage to mirror (1–100, default 100): ").strip() or "100"
         while True:
             try:
@@ -464,13 +471,38 @@ def setup():
     print()
     n = int(ginput("How many hotkeys to copy: ").strip())
     hotkeys, weights = [], []
-    print(GREEN + "Enter each hotkey + optional weight (default 1.0). Example: 5Eabc123 0.6" + RESET)
+    gprint("Enter each hotkey + optional weight (default 1.0). Example: 5Eabc123 0.6")
     for i in range(n):
         parts = ginput(f"Hotkey {i+1}: ").split()
         hotkeys.append(parts[0])
         weights.append(float(parts[1]) if len(parts) > 1 else 1.0)
 
+    # >>> NEW: immediate weight explainer with a basic example <<<
+    print()
+    gprint("Weight recap & example:")
+    if mode == "fixed":
+        fa = float(fixed_amount)
+        if weights_in_fixed:
+            gprint(f"  You chose FIXED = {fa:.4f} TAO and ENABLED weights in fixed mode.")
+            gprint("  That means each wallet's trade = FIXED × its weight.")
+            for idx, (hk, w) in enumerate(zip(hotkeys, weights), 1):
+                gprint(f"    Wallet {idx} ({hk[:8]}…): weight {w:.2f} → example trade {fa*w:.4f} TAO")
+        else:
+            gprint(f"  You chose FIXED = {fa:.4f} TAO and DISABLED weights in fixed mode.")
+            gprint("  That means each wallet's trade = FIXED (weights are ignored).")
+            for idx, hk in enumerate(hotkeys, 1):
+                gprint(f"    Wallet {idx} ({hk[:8]}…): example trade {fa:.4f} TAO")
+    else:
+        pct = float(proportional_pct) / 100.0
+        base = 1.00 * pct
+        gprint(f"  You chose PROPORTIONAL = {pct*100:.0f}% of the detected delta.")
+        gprint("  Example if a watched wallet stakes +1.00 TAO:")
+        for idx, (hk, w) in enumerate(zip(hotkeys, weights), 1):
+            gprint(f"    Wallet {idx} ({hk[:8]}…): weight {w:.2f} → base {base:.4f} × {w:.2f} = {base*w:.4f} TAO")
+        gprint("  (For unstakes, the same amounts are removed.)")
+
     # Heartbeat poll (backup only)
+    print()
     poll = int(ginput("Polling seconds for backup (default 30): ") or "30")
 
     # Webhooks
@@ -487,7 +519,7 @@ def setup():
         "trade_mode": mode,                 # fixed | proportional
         "fixed_amount": fixed_amount,
         "proportional_pct": proportional_pct,
-        "weights_in_fixed": weights_in_fixed,  # NEW: apply hotkey weights in fixed mode?
+        "weights_in_fixed": weights_in_fixed,  # apply hotkey weights in fixed mode?
         "hotkeys": hotkeys,
         "weights": weights,
         "poll_seconds": poll,
@@ -507,10 +539,6 @@ def setup():
         notify_text(live_webhook, f"✅ TAOplicate setup complete for {len(hotkeys)} wallets on `{network}`.")
     if summary_webhook:
         notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
-
-def send_amount_computed_debug(cfg, mode_used, amount_base, weight, amount_final):
-    # Lightweight debug helper (optional).
-    pass
 
 def run():
     # Short intro
