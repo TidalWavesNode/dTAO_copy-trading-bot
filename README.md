@@ -25,26 +25,26 @@ Real-time, PM2-managed bot that mirrors **stake/unstake** actions from chosen Bi
 
 ## 🧱 Architecture
 
-```mermaid
+```
 flowchart LR
-  A[Local Subtensor Node<br/>ws://127.0.0.1:9944] -- StakeAdded/Removed --> E{Event Listener}
-  B[Finney WS Backup<br/>wss://finney.subtensor.ai:443] -- if local fails --> E
+  A[Local Subtensor Node (ws://127.0.0.1:9944)] -->|StakeAdded / StakeRemoved| E{Event Listener}
+  B[Finney WS Backup (wss://finney.subtensor.ai:443)] -->|If local fails| E
   E --> Q[(Event Queue)]
-  Q --> L[Logic: filter watched hotkeys<br/>calc amount (mode/weights)]
+  Q --> L[Logic: filter watched hotkeys and calculate amount (mode/weights)]
   L --> S[Safety: low balance pause/resume]
   S -->|ok| T[btcli stake add/remove]
   S -->|paused| D1[Discord: pause alert]
   T --> D2[Discord: live embed]
   T --> DB[(SQLite trades)]
-  CR[00:00 UTC Scheduler] --> DS[Discord: daily summary<br/>wallet balance + trend]
+  CR[00:00 UTC Scheduler] --> DS[Discord: daily summary with wallet balance + trend]
 ```
 
 ## Install
 Prereqs: Python 3.10+, Node.js (for PM2), btcli configured, and (recommended) a local subtensor node exposing WebSocket ws://127.0.0.1:9944
 
 ### Clone and enter
-`git clone YOUR_REPO_URL.git bittensor-copytrader`
-`cd bittensor-copytrader`
+`git clone https://github.com/TidalWavesNode/dTAO_copy-trading-bot.git`
+`cd dTAO_copy-trading-bot`
 
 ### Python deps
 `python3 -m venv .venv && source .venv/bin/activate`
