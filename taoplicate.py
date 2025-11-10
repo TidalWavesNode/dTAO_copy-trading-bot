@@ -4,7 +4,7 @@ TAOplicate — Real-Time BitTensor Copy-Trading Bot
 -------------------------------------------------
 - Mirrors stake/unstake actions from watched hotkeys across ALL subnets.
 - Real-time (optional) via WebSocket to a Subtensor node; robust polling fallback.
-- Trade sizing: 1) fixed amount OR 2) proportional % of the detected delta, with per-hotkey weights.
+- Trade sizing: 1) fixed amount OR 2) proportional % of the detected delta, with optional per-hotkey weights.
 - Discord live alerts + daily summary (00:00 UTC) with net gain/loss and wallet trend.
 - Uses TAOStats in the BACKEND (no prompts) to focus polling on subnets where watched hotkeys are active.
 - Wallet balance uses `btcli w balance --wallet-name <wallet> --network <net>`.
@@ -425,6 +425,7 @@ def setup():
 
     fixed_amount = ""
     proportional_pct = ""
+    weights_in_fixed = False
     if mode == "fixed":
         fixed_amount = ginput("Fixed TAO per trade (e.g., 0.25): ").strip()
         while True:
@@ -433,6 +434,18 @@ def setup():
                 break
             except:
                 fixed_amount = ginput("Please enter a numeric TAO amount (e.g., 0.25): ").strip()
+
+        # Explain and offer weights-in-fixed
+        print()
+        print(GREEN + "Option: Per-hotkey weights in FIXED mode" + RESET)
+        print(GREEN + "  If enabled, your fixed amount is multiplied per wallet by its weight." + RESET)
+        print(GREEN + "  Examples:" + RESET)
+        print(GREEN + "    • Fixed = 0.25 TAO, weight 2.0  → you trade 0.50 TAO for that wallet" + RESET)
+        print(GREEN + "    • Fixed = 0.25 TAO, weight 0.5  → you trade 0.125 TAO for that wallet" + RESET)
+        print(GREEN + "  Impact: lets you prioritize or downweight specific wallets without changing the global fixed size." + RESET)
+        yn = (ginput("Enable per-hotkey weights in FIXED mode? [y/N]: ").strip().lower() or "n")
+        weights_in_fixed = yn == "y"
+
     else:
         print()
         print(GREEN + "Proportional mode = If a watched wallet stakes +1.00 TAO and you set 50%, you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes." + RESET)
@@ -474,6 +487,7 @@ def setup():
         "trade_mode": mode,                 # fixed | proportional
         "fixed_amount": fixed_amount,
         "proportional_pct": proportional_pct,
+        "weights_in_fixed": weights_in_fixed,  # NEW: apply hotkey weights in fixed mode?
         "hotkeys": hotkeys,
         "weights": weights,
         "poll_seconds": poll,
@@ -493,6 +507,10 @@ def setup():
         notify_text(live_webhook, f"✅ TAOplicate setup complete for {len(hotkeys)} wallets on `{network}`.")
     if summary_webhook:
         notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
+
+def send_amount_computed_debug(cfg, mode_used, amount_base, weight, amount_final):
+    # Lightweight debug helper (optional).
+    pass
 
 def run():
     # Short intro
@@ -548,13 +566,15 @@ def run():
                 i = cfg["hotkeys"].index(hk)
                 weight = cfg["weights"][i]
 
-                # amount calculation (fixed OR proportional% of delta), then apply weight
+                # amount calculation
                 if cfg["trade_mode"] == "fixed":
-                    amount = float(cfg["fixed_amount"])
+                    base = float(cfg["fixed_amount"])
+                    weight_to_use = weight if cfg.get("weights_in_fixed", False) else 1.0
                 else:
                     pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
-                    amount = abs(delta) * pct
-                amount *= weight
+                    base = abs(delta) * pct
+                    weight_to_use = weight
+                amount = base * weight_to_use
 
                 # safety: pause/resume by wallet balance
                 current_balance = get_wallet_balance(cfg)
@@ -569,7 +589,7 @@ def run():
                         continue
 
                 if dry_run:
-                    log(f"[DRY-RUN] Would {action.upper()} {amount:.4f} TAO on netuid {netuid} for {hk}")
+                    log(f"[DRY-RUN] Would {action.upper()} {amount:.4f} TAO on netuid {netuid} for {hk} (base {base:.4f}, weight {weight_to_use:.2f})")
                 else:
                     mirror_stake(action, netuid, cfg, amount, hk, delta, summary)
                     log_trade_to_db(action, netuid, hk, amount, delta, current_balance)
@@ -628,11 +648,13 @@ def run():
 
                         weight = cfg["weights"][i]
                         if cfg["trade_mode"] == "fixed":
-                            amount = float(cfg["fixed_amount"])
+                            base = float(cfg["fixed_amount"])
+                            weight_to_use = weight if cfg.get("weights_in_fixed", False) else 1.0
                         else:
                             pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
-                            amount = abs(delta) * pct
-                        amount *= weight
+                            base = abs(delta) * pct
+                            weight_to_use = weight
+                        amount = base * weight_to_use
 
                         current_balance = get_wallet_balance(cfg)
                         if not paused and current_balance < cfg["low_balance"]:
@@ -646,7 +668,7 @@ def run():
                                 continue
 
                         if dry_run:
-                            log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk}")
+                            log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk} (base {base:.4f}, weight {weight_to_use:.2f})")
                         else:
                             if delta > 0:
                                 mirror_stake("add", netuid, cfg, amount, hk, delta, summary)
