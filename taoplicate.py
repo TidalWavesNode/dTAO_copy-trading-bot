@@ -2,20 +2,28 @@
 """
 TAOplicate — Real-Time BitTensor Copy-Trading Bot
 -------------------------------------------------
-- Watches chosen hotkeys across ALL subnets for stake/unstake changes.
-- Realtime via local Subtensor node WS; fallback to Finney WS; polling heartbeat backup.
-- Mirrors actions with btcli using fixed / proportional (% of delta) + per-wallet weighting.
+- Mirrors stake/unstake actions from watched hotkeys across ALL subnets.
+- Real-time (optional) via WebSocket to a Subtensor node; robust polling fallback.
+- Trade sizing: fixed amount OR proportional % of the detected delta, with per-hotkey weights.
 - Discord live alerts + daily summary (00:00 UTC) with net gain/loss and wallet trend.
-- Auto-pause on low balance, auto-resume on recovery.
-- SQLite logging, --dry-run support, --summary-now at startup.
+- Auto-pause on low balance; auto-resume on recovery.
+- Optional TAOStats integration to read total balance & focus polling on active subnets.
+- SQLite audit log. Flags: --dry-run, --summary-now, --poll-only, --no-poll.
 """
 
-import os, sys, time, json, shutil, sqlite3, subprocess, datetime, threading, queue, re
+import os, sys, time, json, shutil, sqlite3, subprocess, datetime, threading, queue, re, logging
 from pathlib import Path
 
 import requests
 import bittensor as bt
 from substrateinterface import SubstrateInterface
+
+# Quiet noisy lower-level logs
+try:
+    logging.getLogger("bittensor").setLevel(logging.WARNING)
+    logging.getLogger("substrateinterface").setLevel(logging.WARNING)
+except Exception:
+    pass
 
 # === Paths / files ===
 CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
@@ -132,6 +140,11 @@ def run_btcli(cmd):
         log("btcli not found on PATH.")
         return 127, "", "not found"
 
+def _extract_first_float(text: str) -> float | None:
+    cleaned = re.sub(r"[^0-9.\n ]+", " ", text)  # remove symbols (e.g. τ)
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", cleaned)
+    return float(m.group(1)) if m else None
+
 def get_wallet_balance_via_btcli(cfg):
     """Parse wallet total balance using `btcli w balance --wallet-name` (no --all)."""
     try:
@@ -145,29 +158,92 @@ def get_wallet_balance_via_btcli(cfg):
         if not out:
             return 0.0
 
-        # Prefer lines mentioning Balance/Free/Total/Available, grab first float
+        # Prefer lines mentioning Balance/Free/Total/Available
         best = None
         for line in out.splitlines():
             low = line.lower()
             if any(k in low for k in ["balance", "free", "total", "available"]):
-                for tok in line.replace(",", " ").split():
-                    try:
-                        best = float(tok)
-                        break
-                    except:
-                        pass
-            if best is not None:
-                break
-
+                val = _extract_first_float(line)
+                if val is not None:
+                    best = val
+                    break
         if best is None:
-            m = re.search(r"([0-9]+\.[0-9]+)", out)
-            return float(m.group(1)) if m else 0.0
-
+            val = _extract_first_float(out)
+            return val if val is not None else 0.0
         return best
     except Exception as e:
         log(f"Error fetching wallet balance: {e}")
         return 0.0
 
+# ----------------- TAOStats helpers (optional) -----------------
+TAOSTATS_TIMEOUT = 10
+
+def _fetch_taostats_html(url: str) -> str | None:
+    try:
+        resp = requests.get(url, timeout=TAOSTATS_TIMEOUT, headers={"User-Agent": "TAOplicate/1.0"})
+        if resp.status_code == 200:
+            return resp.text
+    except Exception as e:
+        log(f"TAOStats fetch error: {e}")
+    return None
+
+def _parse_taostats_totals_and_subnets(html: str):
+    """
+    Returns (total_tao_balance: float|None, subnets: set[int])
+    Heuristic parser:
+      - finds a numeric balance on lines with 'balance' keywords
+      - extracts netuids like '#12', 'Subnet 12', 'Netuid 12'
+    """
+    total = None
+    subnets = set()
+
+    lines = html.splitlines()
+    for line in lines:
+        low = line.lower()
+        if any(k in low for k in ["total balance", "tao balance", "wallet balance", "balance"]):
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", re.sub(r"[^0-9.\s]", " ", line))
+            if m:
+                try:
+                    total = float(m.group(1))
+                    break
+                except:
+                    pass
+
+    for m in re.finditer(r"(?:#|subnet\s+|netuid\s+)(\d{1,3})", html, flags=re.IGNORECASE):
+        try:
+            n = int(m.group(1))
+            if 0 <= n < 128:
+                subnets.add(n)
+        except:
+            continue
+
+    return total, subnets
+
+def get_wallet_info_via_taostats(cfg):
+    """
+    Returns (total_balance: float|None, subnets: set[int]) from TAOStats page.
+    If disabled or fetch/parse fails, returns (None, set()).
+    """
+    if not cfg.get("use_taostats"):
+        return None, set()
+    url = cfg.get("taostats_account_url", "").strip()
+    if not url:
+        return None, set()
+    html = _fetch_taostats_html(url)
+    if not html:
+        return None, set()
+    total, nets = _parse_taostats_totals_and_subnets(html)
+    return total, nets
+
+def get_wallet_balance(cfg) -> float:
+    # Try TAOStats first
+    total, _ = get_wallet_info_via_taostats(cfg)
+    if total is not None:
+        return total
+    # Fallback to btcli
+    return get_wallet_balance_via_btcli(cfg)
+
+# ----------------- Mirror stake -----------------
 def mirror_stake(action, netuid, cfg, amount, hk, delta, summary):
     if amount <= 0:
         return
@@ -192,12 +268,11 @@ def send_summary_embed(cfg, summary):
     webhook = cfg.get("summary_webhook")
     if not webhook: return
 
-    total_balance = get_wallet_balance_via_btcli(cfg)
+    total_balance = get_wallet_balance(cfg)
     total_add = summary.get("add_tao", 0.0)
     total_rem = summary.get("rem_tao", 0.0)
     net = total_add - total_rem
 
-    # trend arrows (balance change since last report)
     trend_file = os.path.join(CONFIG_DIR, "last_balance.json")
     last_balance = 0.0
     if os.path.exists(trend_file):
@@ -240,10 +315,13 @@ def summary_scheduler(cfg, summary):
         send_summary_embed(cfg, summary.copy())
         summary.update({"trades": 0, "add_tao": 0.0, "rem_tao": 0.0, "subnets": set()})
 
-# ----------------- Event Listener (local -> Finney fallback) -----------------
+# ----------------- Event Listener (optional WS) -----------------
 def start_event_listener(cfg):
-    """Connect to local node for realtime; fallback to Finney; push events into queue."""
-    urls = ["ws://127.0.0.1:9944", "wss://finney.subtensor.ai:443"]
+    """
+    Try to subscribe to on-chain events via WebSocket.
+    If we cannot connect, we just return (polling-only mode).
+    """
+    urls = cfg.get("ws_endpoints") or ["ws://127.0.0.1:9944"]  # user-configurable
     sub = None
     for url in urls:
         try:
@@ -252,10 +330,11 @@ def start_event_listener(cfg):
             notify_text(cfg.get("live_webhook"), f"🛰 Connected to `{url}` for real-time stake events.")
             break
         except Exception as e:
-            log(f"Failed to connect to {url}: {e}")
+            log(f"WS connect failed: {url} ({e})")
             sub = None
+
     if sub is None:
-        log("❌ Could not connect to any WebSocket endpoints.")
+        log("Running in polling-only mode (no WebSocket).")
         return
 
     def events_handler(event, update_nr, subscription_id):
@@ -263,7 +342,6 @@ def start_event_listener(cfg):
             ev = event.get("event", {})
             if ev.get("module_id") == "SubtensorModule" and ev.get("event_id") in ["StakeAdded", "StakeRemoved"]:
                 attrs = ev.get("attributes", [])
-                # Expected order: [netuid, hotkey, amount]
                 if len(attrs) >= 3:
                     netuid = int(attrs[0])
                     hotkey = str(attrs[1])
@@ -276,54 +354,55 @@ def start_event_listener(cfg):
     try:
         sub.subscribe_events(events_handler)
     except Exception as e:
-        log(f"Subscription error: {e}")
+        log(f"Subscription error (polling-only continues): {e}")
 
-# ----------------- Subnet discovery (no 'subnet_count' dependency) -----------------
+# ----------------- Subnet discovery (cap at 128) -----------------
 _NETUID_CACHE = {"list": [], "ts": 0}
 
-def discover_netuids(subtensor, max_scan=256, cache_secs=600):
+def discover_netuids(subtensor, max_scan=128, cache_secs=600):
     """
     Returns a list of active netuids.
-    Tries modern APIs first, then legacy, then a safe scan fallback.
-    Caches results for a short period to avoid heavy calls.
+    Prefers chain-provided lists; only then a small, quiet scan (0..127).
+    Caches results briefly to reduce load.
     """
     now = time.time()
     if _NETUID_CACHE["list"] and now - _NETUID_CACHE["ts"] < cache_secs:
         return _NETUID_CACHE["list"]
 
-    # 1) Preferred (modern)
+    # Prefer modern API
     try:
         if hasattr(subtensor, "get_all_subnet_netuids"):
             netuids = list(subtensor.get_all_subnet_netuids())
             if netuids:
+                netuids = sorted(set(int(n) for n in netuids if 0 <= int(n) < max_scan))
                 _NETUID_CACHE.update({"list": netuids, "ts": now})
                 return netuids
     except Exception:
         pass
 
-    # 2) Legacy
+    # Legacy: objects with .netuid
     try:
         if hasattr(subtensor, "subnets"):
             subs = subtensor.subnets()
-            netuids = [getattr(s, "netuid", None) for s in subs]
-            netuids = [n for n in netuids if isinstance(n, int)]
+            netuids = [int(getattr(s, "netuid", -1)) for s in subs if getattr(s, "netuid", None) is not None]
+            netuids = sorted(set(n for n in netuids if 0 <= n < max_scan))
             if netuids:
                 _NETUID_CACHE.update({"list": netuids, "ts": now})
                 return netuids
     except Exception:
         pass
 
-    # 3) Fallback: lightweight scan
-    netuids = []
+    # Quiet, bounded fallback scan
+    found = []
     for uid in range(max_scan):
         try:
             mg = subtensor.metagraph(netuid=uid)
             if getattr(mg, "hotkeys", None) is not None:
-                netuids.append(uid)
+                found.append(uid)
         except Exception:
             continue
 
-    netuids = sorted(set(netuids))
+    netuids = sorted(set(found))
     _NETUID_CACHE.update({"list": netuids, "ts": now})
     return netuids
 
@@ -331,15 +410,20 @@ def discover_netuids(subtensor, max_scan=256, cache_secs=600):
 def setup():
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
-    # Brief intro (replaces ASCII art)
+    # Brief intro
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
 
-    # Network first (default finney)
     network = input("Network (default finney): ").strip() or "finney"
-
     my_wallet = input("Your wallet name: ").strip()
 
-    # ===== Mode FIRST =====
+    # Optional TAOStats integration
+    use_taostats = (input("Use TAOStats for balance & subnet focus? [y/N]: ").strip().lower() == "y")
+    taostats_account_url = ""
+    if use_taostats:
+        raw = input("Paste TAOStats account URL or address (e.g., 5GuR...): ").strip()
+        taostats_account_url = raw if raw.startswith("http") else f"https://taostats.io/account/{raw}"
+
+    # Trade sizing mode first
     print("\nTrade sizing mode:")
     print("  - fixed: use a constant TAO amount each time")
     print("  - proportional: mirror a percentage of the watched wallet’s stake change")
@@ -392,7 +476,7 @@ def setup():
     resume_bal = float(input("Resume-balance threshold (resume when above, e.g., 2.0 TAO): ").strip() or 2.0)
 
     cfg = {
-        "network": network,                 # e.g., finney
+        "network": network,
         "my_wallet": my_wallet,
         "trade_mode": mode,                 # fixed | proportional
         "fixed_amount": fixed_amount,
@@ -404,10 +488,14 @@ def setup():
         "summary_webhook": summary_webhook,
         "low_balance": low_bal,
         "resume_balance": resume_bal,
-        "btcli_path": shutil.which("btcli") or "btcli"
+        "btcli_path": shutil.which("btcli") or "btcli",
+        "use_taostats": use_taostats,
+        "taostats_account_url": taostats_account_url,
+        # Optional: add remote WS endpoints if you have them:
+        # "ws_endpoints": ["wss://your-node.example.com:443"]
     }
     save_json(CONFIG_PATH, cfg)
-    save_json(STATE_PATH, {"last_stakes": {}})
+    save_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
     init_db()
     log("Setup complete.")
     if live_webhook:
@@ -416,18 +504,28 @@ def setup():
         notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
 
 def run():
-    # Brief intro (replaces ASCII art)
+    # Brief intro
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
 
     dry_run = "--dry-run" in sys.argv
     summary_now = "--summary-now" in sys.argv
+    poll_only = "--poll-only" in sys.argv
+    no_poll   = "--no-poll" in sys.argv
 
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
         log("Run setup first.")
         return
 
-    state = load_json(STATE_PATH, {"last_stakes": {}})
+    state = load_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
+    # normalize state types
+    if "active_map" not in state or not isinstance(state["active_map"], dict):
+        state["active_map"] = {}
+    if "last_stakes" not in state or not isinstance(state["last_stakes"], dict):
+        state["last_stakes"] = {}
+    if "cycle" not in state or not isinstance(state["cycle"], int):
+        state["cycle"] = 0
+
     init_db()
 
     paused = False
@@ -436,7 +534,11 @@ def run():
 
     # scheduler + WS listener
     threading.Thread(target=summary_scheduler, args=(cfg, summary), daemon=True).start()
-    threading.Thread(target=start_event_listener, args=(cfg,), daemon=True).start()
+
+    if poll_only:
+        log("Flag --poll-only: skipping WS listener.")
+    else:
+        threading.Thread(target=start_event_listener, args=(cfg,), daemon=True).start()
 
     if cfg.get("summary_webhook"):
         notify_text(cfg["summary_webhook"], "⏰ Daily summary set to post at **00:00 UTC**.")
@@ -465,7 +567,7 @@ def run():
                 amount *= weight
 
                 # safety: pause/resume by wallet balance
-                current_balance = get_wallet_balance_via_btcli(cfg)
+                current_balance = get_wallet_balance(cfg)
                 if not paused and current_balance < cfg["low_balance"]:
                     paused = True
                     notify_text(cfg.get("live_webhook"), f"⛔ **Paused** — balance {current_balance:.4f} TAO < {cfg['low_balance']} TAO.")
@@ -483,58 +585,87 @@ def run():
                     log_trade_to_db(action, netuid, hk, amount, delta, current_balance)
 
             # ===== fallback polling (heartbeat) =====
-            netuids = discover_netuids(subtensor, max_scan=256, cache_secs=600)
-            for netuid in netuids:
-                mg = subtensor.metagraph(netuid=netuid)
-                if not getattr(mg, "hotkeys", None):
-                    continue
-                for i, hk in enumerate(cfg["hotkeys"]):
-                    if hk not in mg.hotkeys:
+            if not no_poll:
+                # Build working set of subnets for this cycle
+                working = set()
+
+                # (A) TAOStats subnets (fast path)
+                tao_total, tao_subnets = get_wallet_info_via_taostats(cfg)
+                working.update(tao_subnets)
+
+                # (B) Learned active subnets per hotkey
+                active_map = state.get("active_map", {})
+                for hk in cfg["hotkeys"]:
+                    for n in active_map.get(hk, []):
+                        if 0 <= int(n) < 128:
+                            working.add(int(n))
+
+                # (C) Periodic global discovery (cheap + cached)
+                cycle = int(state.get("cycle", 0))
+                if cycle % 20 == 0 or not working:
+                    discovered = discover_netuids(subtensor, max_scan=128, cache_secs=600)
+                    working.update(discovered)
+                state["cycle"] = cycle + 1
+
+                netuids = sorted(working)
+
+                for netuid in netuids:
+                    mg = subtensor.metagraph(netuid=netuid)
+                    if not getattr(mg, "hotkeys", None):
                         continue
-                    idx = mg.hotkeys.index(hk)
-                    stake_val = float(mg.stake[idx])
+                    for i, hk in enumerate(cfg["hotkeys"]):
+                        if hk not in mg.hotkeys:
+                            continue
+                        idx = mg.hotkeys.index(hk)
+                        stake_val = float(mg.stake[idx])
 
-                    # remember last stake for this (netuid, hotkey)
-                    state["last_stakes"].setdefault(str(netuid), {})
-                    last = state["last_stakes"][str(netuid)].get(hk)
-                    state["last_stakes"][str(netuid)][hk] = stake_val
-                    if last is None:
-                        continue
-
-                    delta = stake_val - last
-                    if abs(delta) < 1e-9:
-                        continue
-
-                    weight = cfg["weights"][i]
-                    if cfg["trade_mode"] == "fixed":
-                        amount = float(cfg["fixed_amount"])
-                    else:
-                        pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
-                        amount = abs(delta) * pct
-                    amount *= weight
-
-                    current_balance = get_wallet_balance_via_btcli(cfg)
-                    if not paused and current_balance < cfg["low_balance"]:
-                        paused = True
-                        notify_text(cfg.get("live_webhook"), f"⛔ **Paused** — balance {current_balance:.4f} TAO < {cfg['low_balance']} TAO.")
-                    if paused:
-                        if current_balance >= cfg["resume_balance"]:
-                            paused = False
-                            notify_text(cfg.get("live_webhook"), f"✅ **Resumed** — balance {current_balance:.4f} TAO ≥ {cfg['resume_balance']} TAO.")
-                        else:
+                        # remember last stake for this (netuid, hotkey)
+                        state["last_stakes"].setdefault(str(netuid), {})
+                        last = state["last_stakes"][str(netuid)].get(hk)
+                        state["last_stakes"][str(netuid)][hk] = stake_val
+                        if last is None:
                             continue
 
-                    if dry_run:
-                        log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk}")
-                    else:
-                        if delta > 0:
-                            mirror_stake("add", netuid, cfg, amount, hk, delta, summary)
-                            log_trade_to_db("add", netuid, hk, amount, delta, current_balance)
-                        else:
-                            mirror_stake("remove", netuid, cfg, amount, hk, delta, summary)
-                            log_trade_to_db("remove", netuid, hk, amount, delta, current_balance)
+                        delta = stake_val - last
+                        if abs(delta) < 1e-9:
+                            continue
 
-            save_json(STATE_PATH, state)
+                        # mark subnet active for this hotkey
+                        s = set(active_map.get(hk, []))
+                        s.add(int(netuid))
+                        active_map[hk] = sorted(s)
+                        state["active_map"] = active_map
+
+                        weight = cfg["weights"][i]
+                        if cfg["trade_mode"] == "fixed":
+                            amount = float(cfg["fixed_amount"])
+                        else:
+                            pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
+                            amount = abs(delta) * pct
+                        amount *= weight
+
+                        current_balance = get_wallet_balance(cfg)
+                        if not paused and current_balance < cfg["low_balance"]:
+                            paused = True
+                            notify_text(cfg.get("live_webhook"), f"⛔ **Paused** — balance {current_balance:.4f} TAO < {cfg['low_balance']} TAO.")
+                        if paused:
+                            if current_balance >= cfg["resume_balance"]:
+                                paused = False
+                                notify_text(cfg.get("live_webhook"), f"✅ **Resumed** — balance {current_balance:.4f} TAO ≥ {cfg['resume_balance']} TAO.")
+                            else:
+                                continue
+
+                        if dry_run:
+                            log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk}")
+                        else:
+                            if delta > 0:
+                                mirror_stake("add", netuid, cfg, amount, hk, delta, summary)
+                                log_trade_to_db("add", netuid, hk, amount, delta, current_balance)
+                            else:
+                                mirror_stake("remove", netuid, cfg, amount, hk, delta, summary)
+                                log_trade_to_db("remove", netuid, hk, amount, delta, current_balance)
+
+                save_json(STATE_PATH, state)
 
         except Exception as e:
             log(f"Loop error: {e}")
@@ -545,7 +676,7 @@ def run():
 # ----------------- Entrypoint -----------------
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ["setup", "run"]:
-        print("Usage: python3 taoplicate.py setup|run [--summary-now] [--dry-run]")
+        print("Usage: python3 taoplicate.py setup|run [--summary-now] [--dry-run] [--poll-only] [--no-poll]")
         sys.exit(1)
     if sys.argv[1] == "setup":
         setup()
