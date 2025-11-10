@@ -26,7 +26,7 @@ Real-time, PM2-managed bot that mirrors **stake/unstake** actions from chosen Bi
 
 ## 🧱 Architecture
 
-```mermaid
+```
 flowchart LR
   A[Local Subtensor Node (ws://127.0.0.1:9944)] -->|StakeAdded / StakeRemoved| E{Event Listener}
   B[Finney WS Backup (wss://finney.subtensor.ai:443)] -->|If local fails| E
