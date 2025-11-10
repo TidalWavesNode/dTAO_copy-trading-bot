@@ -9,7 +9,8 @@ TAOplicate — Real-Time BitTensor Copy-Trading Bot
 - Uses TAOStats on the backend (no prompts) to focus polling on relevant subnets.
 - Wallet balance via `btcli w balance --wallet-name <wallet> --network <net>`.
 - SQLite audit log.
-- PM2 integration: always prompt at end of setup (unless --pm2/--no-pm2). Prompt works even if stdin is weird.
+- PM2 integration: always prompt at end of setup (unless --pm2/--no-pm2). Prompt works even if stdin is odd.
+- Diagnostics: --debug, --once, heartbeat logs, immediate poll pass.
 """
 
 import os, sys, time, json, shutil, sqlite3, subprocess, datetime, threading, queue, re, logging
@@ -49,14 +50,13 @@ def ginput(prompt_text: str) -> str:
     """Green prompt input with robust fallbacks (stdin, then /dev/tty)."""
     prompt = f"{GREEN}{prompt_text}{RESET}"
     try:
+        # Print prompt and flush, then call input() without its own prompt (avoids double printing)
         sys.stdout.write(prompt)
         sys.stdout.flush()
-        return input()  # uses the already-printed prompt
+        return input()
     except EOFError:
-        # fallback to /dev/tty
         return _tty_input(prompt)
     except Exception:
-        # last resort plain input
         try:
             return input(prompt_text)
         except Exception:
@@ -485,6 +485,7 @@ def setup():
         "low_balance": low_bal, "resume_balance": resume_bal,
         "btcli_path": shutil.which("btcli") or "btcli",
         # Optional: "ws_endpoints": ["wss://your-node.example.com:443"],
+        # Optional discovery tuning: "scan_every_n_cycles": 20  (0 disables discovery)
     }
     save_json(CONFIG_PATH, cfg)
     save_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
@@ -498,7 +499,6 @@ def setup():
     elif "--no-pm2" in sys.argv:
         gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
     else:
-        # FORCE a prompt even in odd environments by using our robust ginput()
         ans = (ginput("Start TAOplicate now with pm2? [y/N]: ").strip().lower() or "n")
         if ans == "y":
             start_pm2_or_hint()
@@ -508,13 +508,22 @@ def setup():
 # Run loop
 def run():
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
-    dry_run = "--dry-run" in sys.argv
-    summary_now = "--summary-now" in sys.argv
-    poll_only = "--poll-only" in sys.argv
-    no_poll   = "--no-poll" in sys.argv
+    dry_run    = "--dry-run" in sys.argv
+    summary_now= "--summary-now" in sys.argv
+    poll_only  = "--poll-only" in sys.argv
+    no_poll    = "--no-poll" in sys.argv
+    debug      = "--debug" in sys.argv
+    run_once   = "--once" in sys.argv
 
     cfg = load_json(CONFIG_PATH, None)
     if not cfg: log("Run setup first."); return
+
+    # Optional discovery tuning from config
+    try:
+        scan_every_n = int(cfg.get("scan_every_n_cycles", 20))
+    except Exception:
+        scan_every_n = 20
+    if scan_every_n < 0: scan_every_n = 0
 
     state = load_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
     if "active_map" not in state or not isinstance(state["active_map"], dict): state["active_map"] = {}
@@ -527,8 +536,10 @@ def run():
     summary = {"trades":0,"add_tao":0.0,"rem_tao":0.0,"subnets":set()}
 
     threading.Thread(target=summary_scheduler, args=(cfg, summary), daemon=True).start()
-    if poll_only: log("Flag --poll-only: skipping WS listener.")
-    else: threading.Thread(target=start_event_listener, args=(cfg,), daemon=True).start()
+    if poll_only:
+        log("Flag --poll-only: skipping WS listener.")
+    else:
+        threading.Thread(target=start_event_listener, args=(cfg,), daemon=True).start()
 
     if cfg.get("summary_webhook"): notify_text(cfg["summary_webhook"], "⏰ Daily summary set to post at **00:00 UTC**.")
     if summary_now:
@@ -536,9 +547,128 @@ def run():
         send_summary_embed(cfg, summary.copy())
 
     poll = int(cfg["poll_seconds"])
+    cycle = int(state.get("cycle", 0))
+
+    def one_poll_pass():
+        nonlocal cycle, state, paused
+        # Build working set of subnets for this cycle
+        working = set()
+
+        # (A) TAOStats-derived subnets — BACKEND: look up each watched hotkey
+        for hk in cfg["hotkeys"]:
+            working.update(taostats_subnets_for_hotkey(hk, ttl=600))
+
+        # (B) Learned active subnets per hotkey (from prior detections)
+        active_map = state.get("active_map", {})
+        for hk in cfg["hotkeys"]:
+            for n in active_map.get(hk, []):
+                if 0 <= int(n) < 128:
+                    working.add(int(n))
+
+        # (C) Periodic global discovery (cheap + cached), if nothing found yet or cadence hits
+        if (scan_every_n > 0 and (cycle % scan_every_n == 0)) or not working:
+            try:
+                discovered = discover_netuids(subtensor, max_scan=128, cache_secs=600)
+                working.update(discovered)
+            except Exception as e:
+                if debug: log(f"Discovery error: {e}")
+
+        netuids = sorted(working)
+        if debug:
+            log(f"[cycle {cycle}] Working subnets: {len(netuids)} → {netuids[:10]}{' …' if len(netuids)>10 else ''}")
+        else:
+            log(f"[cycle {cycle}] Polling {len(netuids)} subnet(s).")
+
+        if not netuids:
+            if debug:
+                log("No candidate subnets yet (TAOStats empty + discovery disabled/empty).")
+            cycle += 1
+            state["cycle"] = cycle
+            save_json(STATE_PATH, state)
+            return
+
+        for netuid in netuids:
+            try:
+                mg = subtensor.metagraph(netuid=netuid)
+            except Exception as e:
+                if debug:
+                    log(f"Metagraph({netuid}) fetch error: {e}")
+                continue
+
+            if not getattr(mg, "hotkeys", None):
+                continue
+
+            for i, hk in enumerate(cfg["hotkeys"]):
+                if hk not in mg.hotkeys:
+                    continue
+                idx = mg.hotkeys.index(hk)
+                try:
+                    stake_val = float(mg.stake[idx])
+                except Exception:
+                    continue
+
+                # remember last stake for this (netuid, hotkey)
+                state["last_stakes"].setdefault(str(netuid), {})
+                last = state["last_stakes"][str(netuid)].get(hk)
+                state["last_stakes"][str(netuid)][hk] = stake_val
+                if last is None:
+                    continue
+
+                delta = stake_val - last
+                if abs(delta) < 1e-9:
+                    continue
+
+                # mark subnet active for this hotkey
+                s = set(active_map.get(hk, []))
+                s.add(int(netuid))
+                active_map[hk] = sorted(s)
+                state["active_map"] = active_map
+
+                weight = cfg["weights"][i]
+                if cfg["trade_mode"] == "fixed":
+                    base = float(cfg["fixed_amount"])
+                    weight_to_use = weight if cfg.get("weights_in_fixed", False) else 1.0
+                else:
+                    pct = float(cfg.get("proportional_pct", "100") or "100") / 100.0
+                    base = abs(delta) * pct
+                    weight_to_use = weight
+                amount = base * weight_to_use
+
+                current_balance = get_wallet_balance(cfg)
+                if not paused and current_balance < cfg["low_balance"]:
+                    paused = True
+                    notify_text(cfg.get("live_webhook"), f"⛔ **Paused** — balance {current_balance:.4f} TAO < {cfg['low_balance']} TAO.")
+                if paused:
+                    if current_balance >= cfg["resume_balance"]:
+                        paused = False
+                        notify_text(cfg.get("live_webhook"), f"✅ **Resumed** — balance {current_balance:.4f} TAO ≥ {cfg['resume_balance']} TAO.")
+                    else:
+                        continue
+
+                if dry_run:
+                    log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk} (base {base:.4f}, weight {weight_to_use:.2f})")
+                else:
+                    if delta > 0:
+                        mirror_stake("add", netuid, cfg, amount, hk, delta, summary)
+                        log_trade_to_db("add", netuid, hk, amount, delta, current_balance)
+                    else:
+                        mirror_stake("remove", netuid, cfg, amount, hk, delta, summary)
+                        log_trade_to_db("remove", netuid, hk, amount, delta, current_balance)
+
+        cycle += 1
+        state["cycle"] = cycle
+        save_json(STATE_PATH, state)
+
+    # ---- immediate pass so it doesn't look idle
+    one_poll_pass()
+    if run_once:
+        log("Completed single poll pass (--once). Exiting.")
+        return
+
+    # Main loop
     while True:
         try:
-            # Realtime events
+            # Realtime events (if any)
             while not event_queue.empty():
                 action, netuid, hk, delta = event_queue.get()
                 if hk not in cfg["hotkeys"]: continue
@@ -566,65 +696,7 @@ def run():
 
             # Polling fallback / heartbeat
             if not no_poll:
-                working = set()
-                for hk in cfg["hotkeys"]:
-                    working.update(taostats_subnets_for_hotkey(hk, ttl=600))
-                active_map = state.get("active_map", {})
-                for hk in cfg["hotkeys"]:
-                    for n in active_map.get(hk, []):
-                        if 0 <= int(n) < 128: working.add(int(n))
-                cycle = int(state.get("cycle", 0))
-                if cycle % 20 == 0 or not working:
-                    discovered = discover_netuids(subtensor, max_scan=128, cache_secs=600)
-                    working.update(discovered)
-                state["cycle"] = cycle + 1
-
-                netuids = sorted(working)
-                for netuid in netuids:
-                    mg = subtensor.metagraph(netuid=netuid)
-                    if not getattr(mg, "hotkeys", None): continue
-                    for i, hk in enumerate(cfg["hotkeys"]):
-                        if hk not in mg.hotkeys: continue
-                        idx = mg.hotkeys.index(hk)
-                        stake_val = float(mg.stake[idx])
-                        state["last_stakes"].setdefault(str(netuid), {})
-                        last = state["last_stakes"][str(netuid)].get(hk)
-                        state["last_stakes"][str(netuid)][hk] = stake_val
-                        if last is None: continue
-                        delta = stake_val - last
-                        if abs(delta) < 1e-9: continue
-
-                        s = set(active_map.get(hk, [])); s.add(int(netuid))
-                        active_map[hk] = sorted(s); state["active_map"] = active_map
-
-                        weight = cfg["weights"][i]
-                        if cfg["trade_mode"] == "fixed":
-                            base = float(cfg["fixed_amount"])
-                            weight_to_use = weight if cfg.get("weights_in_fixed", False) else 1.0
-                        else:
-                            pct = float(cfg.get("proportional_pct", "100") or "100")/100.0
-                            base = abs(delta) * pct; weight_to_use = weight
-                        amount = base * weight_to_use
-
-                        current_balance = get_wallet_balance(cfg)
-                        if not paused and current_balance < cfg["low_balance"]:
-                            paused = True; notify_text(cfg.get("live_webhook"), f"⛔ **Paused** — balance {current_balance:.4f} TAO < {cfg['low_balance']} TAO.")
-                        if paused:
-                            if current_balance >= cfg["resume_balance"]:
-                                paused = False; notify_text(cfg.get("live_webhook"), f"✅ **Resumed** — balance {current_balance:.4f} TAO ≥ {cfg['resume_balance']} TAO.")
-                            else: continue
-
-                        if dry_run:
-                            log(f"[DRY-RUN] Would {'ADD' if delta>0 else 'REMOVE'} {amount:.4f} TAO (netuid {netuid}) for {hk} (base {base:.4f}, weight {weight_to_use:.2f})")
-                        else:
-                            if delta > 0:
-                                mirror_stake("add", netuid, cfg, amount, hk, delta, summary)
-                                log_trade_to_db("add", netuid, hk, amount, delta, current_balance)
-                            else:
-                                mirror_stake("remove", netuid, cfg, amount, hk, delta, summary)
-                                log_trade_to_db("remove", netuid, hk, amount, delta, current_balance)
-
-                save_json(STATE_PATH, state)
+                one_poll_pass()
 
         except Exception as e:
             log(f"Loop error: {e}")
@@ -635,7 +707,7 @@ def run():
 # Entrypoint
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ["setup","run"]:
-        print("Usage: python3 taoplicate.py setup|run [--pm2|--no-pm2] [--summary-now] [--dry-run] [--poll-only] [--no-poll]")
+        print("Usage: python3 taoplicate.py setup|run [--pm2|--no-pm2] [--summary-now] [--dry-run] [--poll-only] [--no-poll] [--debug] [--once]")
         sys.exit(1)
     if sys.argv[1] == "setup":
         setup()
