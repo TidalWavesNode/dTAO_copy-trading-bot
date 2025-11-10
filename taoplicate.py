@@ -4,10 +4,10 @@ TAOplicate — Real-Time BitTensor Copy-Trading Bot
 -------------------------------------------------
 - Mirrors stake/unstake actions from watched hotkeys across ALL subnets.
 - Real-time (optional) via WebSocket to a Subtensor node; robust polling fallback.
-- Trade sizing: fixed amount OR proportional % of the detected delta, with per-hotkey weights.
+- Trade sizing: 1) fixed amount OR 2) proportional % of the detected delta, with per-hotkey weights.
 - Discord live alerts + daily summary (00:00 UTC) with net gain/loss and wallet trend.
-- Auto-pause on low balance; auto-resume on recovery.
-- Optional TAOStats integration to read total balance & focus polling on active subnets.
+- Uses TAOStats in the BACKEND (no prompts) to focus polling on subnets where watched hotkeys are active.
+- Wallet balance uses `btcli w balance --wallet-name <wallet> --network <net>`.
 - SQLite audit log. Flags: --dry-run, --summary-now, --poll-only, --no-poll.
 """
 
@@ -24,6 +24,23 @@ try:
     logging.getLogger("substrateinterface").setLevel(logging.WARNING)
 except Exception:
     pass
+
+# Try to enable ANSI on Windows
+try:
+    import colorama
+    colorama.init()
+except Exception:
+    pass
+
+# === ANSI helpers ===
+GREEN = "\033[92m"
+RESET = "\033[0m"
+def ginput(prompt_text: str) -> str:
+    """Green prompt input with graceful fallback."""
+    try:
+        return input(f"{GREEN}{prompt_text}{RESET}")
+    except Exception:
+        return input(prompt_text)
 
 # === Paths / files ===
 CONFIG_DIR  = os.path.expanduser("~/.taoplicate")
@@ -146,7 +163,7 @@ def _extract_first_float(text: str) -> float | None:
     return float(m.group(1)) if m else None
 
 def get_wallet_balance_via_btcli(cfg):
-    """Parse wallet total balance using `btcli w balance --wallet-name` (no --all)."""
+    """Wallet total balance using `btcli w balance --wallet-name` (no --all)."""
     try:
         cmd = [
             cfg["btcli_path"], "w", "balance",
@@ -158,7 +175,6 @@ def get_wallet_balance_via_btcli(cfg):
         if not out:
             return 0.0
 
-        # Prefer lines mentioning Balance/Free/Total/Available
         best = None
         for line in out.splitlines():
             low = line.lower()
@@ -175,8 +191,13 @@ def get_wallet_balance_via_btcli(cfg):
         log(f"Error fetching wallet balance: {e}")
         return 0.0
 
-# ----------------- TAOStats helpers (optional) -----------------
+def get_wallet_balance(cfg) -> float:
+    # Per requirements: rely on btcli for our wallet balance.
+    return get_wallet_balance_via_btcli(cfg)
+
+# ----------------- TAOStats helpers (BACKEND ONLY) -----------------
 TAOSTATS_TIMEOUT = 10
+_TAOSTATS_CACHE = {"map": {}, "ts": 0}  # {hotkey: (set(netuid), ts)}
 
 def _fetch_taostats_html(url: str) -> str | None:
     try:
@@ -187,28 +208,11 @@ def _fetch_taostats_html(url: str) -> str | None:
         log(f"TAOStats fetch error: {e}")
     return None
 
-def _parse_taostats_totals_and_subnets(html: str):
+def _parse_taostats_subnets(html: str) -> set[int]:
     """
-    Returns (total_tao_balance: float|None, subnets: set[int])
-    Heuristic parser:
-      - finds a numeric balance on lines with 'balance' keywords
-      - extracts netuids like '#12', 'Subnet 12', 'Netuid 12'
+    Extract netuids from patterns like '#12', 'Subnet 12', 'Netuid 12'.
     """
-    total = None
     subnets = set()
-
-    lines = html.splitlines()
-    for line in lines:
-        low = line.lower()
-        if any(k in low for k in ["total balance", "tao balance", "wallet balance", "balance"]):
-            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", re.sub(r"[^0-9.\s]", " ", line))
-            if m:
-                try:
-                    total = float(m.group(1))
-                    break
-                except:
-                    pass
-
     for m in re.finditer(r"(?:#|subnet\s+|netuid\s+)(\d{1,3})", html, flags=re.IGNORECASE):
         try:
             n = int(m.group(1))
@@ -216,32 +220,25 @@ def _parse_taostats_totals_and_subnets(html: str):
                 subnets.add(n)
         except:
             continue
+    return subnets
 
-    return total, subnets
+def taostats_subnets_for_hotkey(hotkey: str, ttl: int = 600) -> set[int]:
+    """
+    Backend-only: fetch https://taostats.io/account/{hotkey} and return active subnets.
+    Cached for `ttl` seconds to avoid hammering.
+    """
+    now = time.time()
+    cached = _TAOSTATS_CACHE["map"].get(hotkey)
+    if cached and now - cached[1] < ttl:
+        return set(cached[0])
 
-def get_wallet_info_via_taostats(cfg):
-    """
-    Returns (total_balance: float|None, subnets: set[int]) from TAOStats page.
-    If disabled or fetch/parse fails, returns (None, set()).
-    """
-    if not cfg.get("use_taostats"):
-        return None, set()
-    url = cfg.get("taostats_account_url", "").strip()
-    if not url:
-        return None, set()
+    url = f"https://taostats.io/account/{hotkey}"
     html = _fetch_taostats_html(url)
     if not html:
-        return None, set()
-    total, nets = _parse_taostats_totals_and_subnets(html)
-    return total, nets
-
-def get_wallet_balance(cfg) -> float:
-    # Try TAOStats first
-    total, _ = get_wallet_info_via_taostats(cfg)
-    if total is not None:
-        return total
-    # Fallback to btcli
-    return get_wallet_balance_via_btcli(cfg)
+        return set()
+    subnets = _parse_taostats_subnets(html)
+    _TAOSTATS_CACHE["map"][hotkey] = (set(subnets), now)
+    return subnets
 
 # ----------------- Mirror stake -----------------
 def mirror_stake(action, netuid, cfg, amount, hk, delta, summary):
@@ -410,70 +407,66 @@ def discover_netuids(subtensor, max_scan=128, cache_secs=600):
 def setup():
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
-    # Brief intro
+    # Short intro
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
 
-    network = input("Network (default finney): ").strip() or "finney"
-    my_wallet = input("Your wallet name: ").strip()
+    network = ginput("Network (default finney): ").strip() or "finney"
+    my_wallet = ginput("Your wallet name: ").strip()
 
-    # Optional TAOStats integration
-    use_taostats = (input("Use TAOStats for balance & subnet focus? [y/N]: ").strip().lower() == "y")
-    taostats_account_url = ""
-    if use_taostats:
-        raw = input("Paste TAOStats account URL or address (e.g., 5GuR...): ").strip()
-        taostats_account_url = raw if raw.startswith("http") else f"https://taostats.io/account/{raw}"
-
-    # Trade sizing mode first
-    print("\nTrade sizing mode:")
-    print("  - fixed: use a constant TAO amount each time")
-    print("  - proportional: mirror a percentage of the watched wallet’s stake change")
-    mode = (input("Choose 'fixed' or 'proportional' [fixed/proportional]: ").strip().lower() or "fixed")
-    while mode not in ("fixed", "proportional"):
-        mode = (input("Please choose 'fixed' or 'proportional': ").strip().lower() or "fixed")
+    # Trade sizing mode FIRST (numeric)
+    print()
+    print(GREEN + "Trade sizing mode:" + RESET)
+    print(GREEN + "  1) fixed — use a constant TAO amount each time" + RESET)
+    print(GREEN + "  2) proportional — mirror a percentage of the watched wallet’s stake change" + RESET)
+    mode_sel = (ginput("Choose 1 or 2 [1/2]: ").strip() or "1")
+    while mode_sel not in ("1", "2"):
+        mode_sel = (ginput("Please choose 1 (fixed) or 2 (proportional): ").strip() or "1")
+    mode = "fixed" if mode_sel == "1" else "proportional"
 
     fixed_amount = ""
     proportional_pct = ""
     if mode == "fixed":
-        fixed_amount = input("Fixed TAO per trade (e.g., 0.25): ").strip()
+        fixed_amount = ginput("Fixed TAO per trade (e.g., 0.25): ").strip()
         while True:
             try:
                 _ = float(fixed_amount)
                 break
             except:
-                fixed_amount = input("Please enter a numeric TAO amount (e.g., 0.25): ").strip()
+                fixed_amount = ginput("Please enter a numeric TAO amount (e.g., 0.25): ").strip()
     else:
-        print("\nProportional mode means: if a watched wallet stakes +1.00 TAO, and you choose 50%,")
-        print("you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes.")
-        proportional_pct = input("Proportional percentage to mirror (1–100, default 100): ").strip() or "100"
+        print()
+        print(GREEN + "Proportional mode = If a watched wallet stakes +1.00 TAO and you set 50%, you will stake +0.50 TAO (before per-wallet weighting). Same idea for unstakes." + RESET)
+        proportional_pct = ginput("Proportional percentage to mirror (1–100, default 100): ").strip() or "100"
         while True:
             try:
                 v = float(proportional_pct)
                 if 0 < v <= 100:
                     break
                 else:
-                    proportional_pct = input("Enter a number between 1 and 100: ").strip()
+                    proportional_pct = ginput("Enter a number between 1 and 100: ").strip()
             except:
-                proportional_pct = input("Enter a number between 1 and 100: ").strip()
+                proportional_pct = ginput("Enter a number between 1 and 100: ").strip()
 
     # Watched hotkeys + optional weights
-    n = int(input("\nHow many hotkeys to copy: ").strip())
+    print()
+    n = int(ginput("How many hotkeys to copy: ").strip())
     hotkeys, weights = [], []
-    print("Enter each hotkey + optional weight (default 1.0). Example: 5Eabc123 0.6")
+    print(GREEN + "Enter each hotkey + optional weight (default 1.0). Example: 5Eabc123 0.6" + RESET)
     for i in range(n):
-        parts = input(f"Hotkey {i+1}: ").split()
+        parts = ginput(f"Hotkey {i+1}: ").split()
         hotkeys.append(parts[0])
         weights.append(float(parts[1]) if len(parts) > 1 else 1.0)
 
     # Heartbeat poll (backup only)
-    poll = int(input("Polling seconds for backup (default 30): ") or "30")
+    poll = int(ginput("Polling seconds for backup (default 30): ") or "30")
 
     # Webhooks
-    live_webhook = input("Discord Webhook for LIVE trade alerts: ").strip()
-    summary_webhook = input("Discord Webhook for DAILY summary reports: ").strip()
+    live_webhook = ginput("Discord Webhook for LIVE trade alerts: ").strip()
+    summary_webhook = ginput("Discord Webhook for DAILY summary reports: ").strip()
 
     # Safety thresholds
-    low_bal = float(input("Low-balance threshold (pause if below, e.g., 1.0 TAO): ").strip() or 1.0)
-    resume_bal = float(input("Resume-balance threshold (resume when above, e.g., 2.0 TAO): ").strip() or 2.0)
+    low_bal = float(ginput("Low-balance threshold (pause if below, e.g., 1.0 TAO): ").strip() or 1.0)
+    resume_bal = float(ginput("Resume-balance threshold (resume when above, e.g., 2.0 TAO): ").strip() or 2.0)
 
     cfg = {
         "network": network,
@@ -489,8 +482,6 @@ def setup():
         "low_balance": low_bal,
         "resume_balance": resume_bal,
         "btcli_path": shutil.which("btcli") or "btcli",
-        "use_taostats": use_taostats,
-        "taostats_account_url": taostats_account_url,
         # Optional: add remote WS endpoints if you have them:
         # "ws_endpoints": ["wss://your-node.example.com:443"]
     }
@@ -504,7 +495,7 @@ def setup():
         notify_text(summary_webhook, "📊 TAOplicate daily summary channel initialized.")
 
 def run():
-    # Brief intro
+    # Short intro
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
 
     dry_run = "--dry-run" in sys.argv
@@ -518,7 +509,6 @@ def run():
         return
 
     state = load_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
-    # normalize state types
     if "active_map" not in state or not isinstance(state["active_map"], dict):
         state["active_map"] = {}
     if "last_stakes" not in state or not isinstance(state["last_stakes"], dict):
@@ -589,18 +579,18 @@ def run():
                 # Build working set of subnets for this cycle
                 working = set()
 
-                # (A) TAOStats subnets (fast path)
-                tao_total, tao_subnets = get_wallet_info_via_taostats(cfg)
-                working.update(tao_subnets)
+                # (A) TAOStats-derived subnets — BACKEND: look up each watched hotkey
+                for hk in cfg["hotkeys"]:
+                    working.update(taostats_subnets_for_hotkey(hk, ttl=600))
 
-                # (B) Learned active subnets per hotkey
+                # (B) Learned active subnets per hotkey (from prior detections)
                 active_map = state.get("active_map", {})
                 for hk in cfg["hotkeys"]:
                     for n in active_map.get(hk, []):
                         if 0 <= int(n) < 128:
                             working.add(int(n))
 
-                # (C) Periodic global discovery (cheap + cached)
+                # (C) Periodic global discovery (cheap + cached), if nothing found yet
                 cycle = int(state.get("cycle", 0))
                 if cycle % 20 == 0 or not working:
                     discovered = discover_netuids(subtensor, max_scan=128, cache_secs=600)
