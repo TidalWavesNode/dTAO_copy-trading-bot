@@ -53,7 +53,7 @@ git clone https://github.com/TidalWavesNode/TAOplicate.git
 ```
 
 ```
-cd taoplicate
+cd TAOplicate
 ```
 
 ### Python deps
