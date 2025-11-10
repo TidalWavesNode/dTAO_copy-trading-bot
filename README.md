@@ -2,7 +2,6 @@
 """
 TAOplicate — Real-Time BitTensor Copy-Trading Bot
 
-Key features:
 - Mirrors stake/unstake actions from watched hotkeys across ALL subnets.
 - Real-time (optional) via WebSocket; robust polling fallback.
 - Trade sizing: 1) fixed amount OR 2) proportional % of delta, with optional per-hotkey weights.
@@ -10,7 +9,7 @@ Key features:
 - Uses TAOStats on the backend (no prompts) to focus polling on relevant subnets.
 - Wallet balance via `btcli w balance --wallet-name <wallet> --network <net>`.
 - SQLite audit log.
-- PM2 integration: prompt at end of setup (or use --pm2 / --no-pm2 flags).
+- PM2 integration: always prompt at end of setup (unless --pm2/--no-pm2).
 """
 
 import os, sys, time, json, shutil, sqlite3, subprocess, datetime, threading, queue, re, logging
@@ -20,7 +19,7 @@ import requests
 import bittensor as bt
 from substrateinterface import SubstrateInterface
 
-# Quiet noisy logs
+# Quiet noisy libs
 try:
     logging.getLogger("bittensor").setLevel(logging.WARNING)
     logging.getLogger("substrateinterface").setLevel(logging.WARNING)
@@ -33,7 +32,8 @@ try:
     colorama.init()
 except Exception:
     pass
-GREEN = "\033[92m"; RESET = "\033[0m"
+GREEN = "\033[92m"
+RESET = "\033[0m"
 def ginput(prompt_text: str) -> str:
     try:
         return input(f"{GREEN}{prompt_text}{RESET}")
@@ -96,7 +96,8 @@ def init_db():
                     delta REAL,
                     balance REAL
                 )""")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def log_trade_to_db(action, netuid, hk, amount, delta, balance):
     conn = sqlite3.connect(DB_PATH)
@@ -105,18 +106,21 @@ def log_trade_to_db(action, netuid, hk, amount, delta, balance):
         "INSERT INTO trades(timestamp, action, netuid, hotkey, amount, delta, balance) VALUES(?,?,?,?,?,?,?)",
         (datetime.datetime.utcnow().isoformat(), action, netuid, hk, amount, delta, balance)
     )
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 # Discord
 def post_embed(webhook, embed):
     if not webhook: return
-    try: requests.post(webhook, json={"embeds":[embed]}, timeout=8)
-    except Exception as e: log(f"Discord send failed: {e}")
+    try:
+        requests.post(webhook, json={"embeds": [embed]}, timeout=8)
+    except Exception as e:
+        log(f"Discord send failed: {e}")
 
 def send_trade_embed(cfg, action, netuid, hk, amount, delta):
     webhook = cfg.get("live_webhook")
     if not webhook: return
-    color = 0x00FF00 if action=="add" else 0xFF0000
+    color = 0x00FF00 if action == "add" else 0xFF0000
     title = f"🕯️ {'Stake Added' if action=='add' else 'Stake Removed'}"
     desc = (
         f"**Subnet:** `{netuid}`\n"
@@ -124,14 +128,20 @@ def send_trade_embed(cfg, action, netuid, hk, amount, delta):
         f"**Change Detected:** `{delta:+.4f} TAO`\n"
         f"**Mirrored Amount:** `{amount:.4f} TAO`"
     )
-    embed = {"title":title,"description":desc,"color":color,
-             "footer":{"text":f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"}}
+    embed = {
+        "title": title,
+        "description": desc,
+        "color": color,
+        "footer": {"text": f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"},
+    }
     post_embed(webhook, embed)
 
 def notify_text(webhook, content):
     if not webhook: return
-    try: requests.post(webhook, json={"content": content}, timeout=8)
-    except Exception as e: log(f"Discord text failed: {e}")
+    try:
+        requests.post(webhook, json={"content": content}, timeout=8)
+    except Exception as e:
+        log(f"Discord text failed: {e}")
 
 # btcli
 def run_btcli(cmd):
@@ -241,16 +251,18 @@ def send_summary_embed(cfg, summary):
     else: trend_emoji, trend_line = "📉", f"{delta_bal:.4f} TAO"
     json.dump({"balance": total_balance}, open(trend_file, "w"))
     net_line = f"🟩 **Net Gain:** `{net:+.4f} TAO`" if net >= 0 else f"🟥 **Net Loss:** `{net:+.4f} TAO`"
-    embed = {"title":"📊 Daily Summary — TAOplicate","color":0x2B6CB0,
-             "description":(
-                f"**Total Trades:** {summary.get('trades', 0)}\n"
-                f"**Subnets Touched:** {len(summary.get('subnets', set()))}\n"
-                f"**Total Staked:** `{total_add:.4f} TAO`\n"
-                f"**Total Unstaked:** `{total_rem:.4f} TAO`\n"
-                f"{net_line}\n\n"
-                f"💰 **Wallet Balance:** `{total_balance:.4f} TAO` ({trend_emoji} {trend_line} since last report)"
-             ),
-             "footer":{"text":f"Report generated {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"}}
+    embed = {
+        "title":"📊 Daily Summary — TAOplicate","color":0x2B6CB0,
+        "description":(
+            f"**Total Trades:** {summary.get('trades', 0)}\n"
+            f"**Subnets Touched:** {len(summary.get('subnets', set()))}\n"
+            f"**Total Staked:** `{total_add:.4f} TAO`\n"
+            f"**Total Unstaked:** `{total_rem:.4f} TAO`\n"
+            f"{net_line}\n\n"
+            f"💰 **Wallet Balance:** `{total_balance:.4f} TAO` ({trend_emoji} {trend_line} since last report)"
+        ),
+        "footer":{"text":f"Report generated {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | TAOplicate"}
+    }
     post_embed(webhook, embed)
 
 def summary_scheduler(cfg, summary):
@@ -305,7 +317,8 @@ def discover_netuids(subtensor, max_scan=128, cache_secs=600):
             if netuids:
                 netuids = sorted(set(int(n) for n in netuids if 0 <= int(n) < max_scan))
                 _NETUID_CACHE.update({"list":netuids,"ts":now}); return netuids
-    except Exception: pass
+    except Exception:
+        pass
     try:
         if hasattr(subtensor, "subnets"):
             subs = subtensor.subnets()
@@ -313,7 +326,8 @@ def discover_netuids(subtensor, max_scan=128, cache_secs=600):
             netuids = sorted(set(n for n in netuids if 0 <= n < max_scan))
             if netuids:
                 _NETUID_CACHE.update({"list":netuids,"ts":now}); return netuids
-    except Exception: pass
+    except Exception:
+        pass
     found = []
     for uid in range(max_scan):
         try:
@@ -323,7 +337,7 @@ def discover_netuids(subtensor, max_scan=128, cache_secs=600):
     netuids = sorted(set(found))
     _NETUID_CACHE.update({"list":netuids,"ts":now}); return netuids
 
-# PM2
+# PM2 helpers (always prompt unless flags)
 def start_pm2_or_hint():
     pm2 = shutil.which("pm2")
     if not pm2:
@@ -331,9 +345,12 @@ def start_pm2_or_hint():
         gprint("Then start later with: pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
         return
     script_path = str(Path(__file__).resolve())
-    cmd = [pm2,"start",script_path,"--name","TAOplicate",
-           "--interpreter", shutil.which("python3") or "python3",
-           "--","run"]
+    cmd = [
+        pm2, "start", script_path,
+        "--name", "TAOplicate",
+        "--interpreter", shutil.which("python3") or "python3",
+        "--", "run"
+    ]
     try:
         log(" ".join(cmd))
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -344,33 +361,17 @@ def start_pm2_or_hint():
             gprint("Started with pm2 as 'TAOplicate'.")
             save = (ginput("Save pm2 process list for restart on boot? [y/N]: ").strip().lower() or "n")
             if save == "y":
-                try: subprocess.run([pm2,"save"], check=False); gprint("pm2 list saved. To enable at boot: pm2 startup")
-                except Exception: pass
+                try:
+                    subprocess.run([pm2, "save"], check=False)
+                    gprint("pm2 list saved. To enable at boot: pm2 startup")
+                except Exception:
+                    pass
         else:
             gprint("pm2 failed to start the process. You can try manually:")
             gprint("  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
     except Exception as e:
         log(f"pm2 start error: {e}")
         gprint("Could not start via pm2. Start manually with the command above.")
-
-def maybe_start_with_pm2(auto_flag: str | None):
-    """
-    auto_flag: 'pm2' -> auto-start; 'nopm2' -> skip; None -> interactive prompt if TTY.
-    """
-    if auto_flag == "pm2":
-        start_pm2_or_hint(); return
-    if auto_flag == "nopm2":
-        gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
-        return
-    # Interactive prompt if TTY; otherwise just print hint.
-    if sys.stdin.isatty():
-        yn = (ginput("Start TAOplicate now with pm2? [y/N]: ").strip().lower() or "n")
-        if yn == "y":
-            start_pm2_or_hint()
-        else:
-            gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
-    else:
-        gprint("Setup complete. Non-interactive session detected.\nStart later with:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
 
 # Setup
 def setup():
@@ -460,19 +461,26 @@ def setup():
         "live_webhook": live_webhook, "summary_webhook": summary_webhook,
         "low_balance": low_bal, "resume_balance": resume_bal,
         "btcli_path": shutil.which("btcli") or "btcli",
+        # Optional: "ws_endpoints": ["wss://your-node.example.com:443"],
     }
     save_json(CONFIG_PATH, cfg)
     save_json(STATE_PATH, {"last_stakes": {}, "active_map": {}, "cycle": 0})
     init_db()
     log("Setup complete.")
 
-    # PM2 prompt / flags
-    auto_flag = None
-    if "--pm2" in sys.argv: auto_flag = "pm2"
-    elif "--no-pm2" in sys.argv: auto_flag = "nopm2"
-    maybe_start_with_pm2(auto_flag)
+    # PM2: always prompt unless explicit flags
+    if "--pm2" in sys.argv:
+        start_pm2_or_hint()
+    elif "--no-pm2" in sys.argv:
+        gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
+    else:
+        yn = (ginput("Start TAOplicate now with pm2? [y/N]: ").strip().lower() or "n")
+        if yn == "y":
+            start_pm2_or_hint()
+        else:
+            gprint("Setup complete. You can later run:\n  pm2 start taoplicate.py --name TAOplicate --interpreter python3 -- run")
 
-# Run
+# Run loop
 def run():
     print("\nTAOplicate — mirror/copy TAO staking actions across BitTensor subnets in real time.\n")
     dry_run = "--dry-run" in sys.argv
@@ -505,6 +513,7 @@ def run():
     poll = int(cfg["poll_seconds"])
     while True:
         try:
+            # Realtime events (if any)
             while not event_queue.empty():
                 action, netuid, hk, delta = event_queue.get()
                 if hk not in cfg["hotkeys"]: continue
@@ -530,6 +539,7 @@ def run():
                     mirror_stake(action, netuid, cfg, amount, hk, delta, summary)
                     log_trade_to_db(action, netuid, hk, amount, delta, current_balance)
 
+            # Polling fallback / heartbeat
             if not no_poll:
                 working = set()
                 for hk in cfg["hotkeys"]:
